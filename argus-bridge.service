@@ -1,0 +1,24 @@
+[Unit]
+Description=Argus rack controller serial bridge
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/argus/argus_bridge.py
+
+# Restart no matter how it exits — a crash or a lost serial
+# connection should recover on its own, not need someone to
+# notice and run it again by hand.
+Restart=always
+RestartSec=2
+
+# Run as your normal user (not root) — that user needs to be a
+# member of the "dialout" group so it can open /dev/ttyS*.
+# See the deployment notes for the one-time setup command.
+User=CHANGE_ME
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

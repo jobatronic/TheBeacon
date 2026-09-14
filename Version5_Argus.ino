@@ -56,12 +56,15 @@
  *    EVT DOOR CLOSED
  *
  *    EVT FIRE <temp>
+ *    EVT FIRE CLEARED
  *    EVT TEMP RISING <rate>
  *    EVT FILTER CLOGGED
+ *    EVT FILTER CLEARED
  *    EVT TEMP SENSOR FAULT
  *    EVT TEMP SENSOR OK
  *
  *    EVT WATER DETECTED
+ *    EVT WATER CLEARED
  *
  *    EVT RESET STARTED <n>
  *    EVT RESET DONE <n>
@@ -94,7 +97,7 @@
  *    A1  – reserved: CT coil / AC current
  *    A2  – reserved: DC voltage divider
  *    A3  – Keyestudio analog temperature sensor (exhaust)
- *    A4  – reserved: water sensor
+ *    A4  – water leak sensor (bottom pan)
  *    A5  – reserved
  *
  *    EXHAUST TEMPERATURE SENSOR (A3):
@@ -136,8 +139,8 @@
 #define ENABLE_FAN              true
 #define ENABLE_AC_SENSORS       false
 #define ENABLE_DC_SENSOR        false
-#define ENABLE_WATER            false
-#define ENABLE_PERIODIC_REPORT  false
+#define ENABLE_WATER            true
+#define ENABLE_PERIODIC_REPORT  true
 
 
 // ═══════════════════════════════════════════════════════════════
@@ -181,10 +184,11 @@
 //      NC contact
 //      Coil de-energized = load ON
 //
-//  Board is ACTIVE-LOW:
+//  Board trigger polarity:
 //
-//    LOW  = coil energized
-//    HIGH = coil de-energized
+//    RELAY_COIL_ON / RELAY_COIL_OFF below are the single source
+//    of truth for this. Confirmed ACTIVE LOW by direct hardware
+//    test: pulling the control pin LOW energizes the relay.
 //
 //  IMPORTANT:
 //  Hardware wiring should provide the actual safety behavior.
@@ -195,6 +199,9 @@
 //
 //    [R1] [R2] [R3] [R4] [R5] [R6] [R7] [R8]
 //
+
+#define RELAY_COIL_ON   LOW
+#define RELAY_COIL_OFF  HIGH
 
 const uint8_t relayPins[8] = {
   2, 4, 5, 6, 7, 8, 9, 10
@@ -305,6 +312,8 @@ const bool relayNC[8] = {
 #define DOOR_PIN             11
 #define DEBOUNCE_MS          50UL
 
+#define WATER_PIN            A4
+
 // The cabinet light (R1) is driven directly by the door switch,
 // not by the Pi. It simply follows door state; the Pi is only
 // told about the door itself (EVT DOOR OPEN / EVT DOOR CLOSED)
@@ -405,7 +414,13 @@ bool doorLast = true;
 
 unsigned long doorChangeTime = 0;
 
-bool doorPending = false;
+
+// ─── Water debounce ──────────────────────────────────────────
+
+bool waterStable = false;
+bool waterLast = false;
+
+unsigned long waterChangeTime = 0;
 
 
 // ─── Relay reset tracking ────────────────────────────────────
@@ -471,6 +486,8 @@ void checkTempAlarms();
 
 void checkDoor();
 
+void checkWater();
+
 void checkResets();
 
 void periodicReport();
@@ -534,12 +551,15 @@ void setup()
 
     // Read the actual state at startup.
     //
-    // LOW = door open
-    // HIGH = door closed
+    // Confirmed wiring: the switch is pressed (pulls to GND, LOW)
+    // when the door is CLOSED, and releases (pulled HIGH by
+    // INPUT_PULLUP) when the door is OPEN.
     //
-    doorStable = (digitalRead(DOOR_PIN) == LOW);
+    // HIGH = door open
+    // LOW  = door closed
+    //
+    doorStable = (digitalRead(DOOR_PIN) == HIGH);
     doorLast = doorStable;
-    doorPending = false;
 
     // The light relay is driven by the door, so it needs to be
     // synced to whatever the door's actual state is right now —
@@ -557,8 +577,31 @@ void setup()
   pinMode(A1, INPUT);
   pinMode(A2, INPUT);
   pinMode(A3, INPUT);
-  pinMode(A4, INPUT);
+  pinMode(WATER_PIN, INPUT);
   pinMode(A5, INPUT);
+
+
+  // ───────────────────────────────────────────────────────────
+  // WATER
+  // ───────────────────────────────────────────────────────────
+
+  #if ENABLE_WATER
+
+    // Read the actual state at startup, same reasoning as DOOR
+    // above — don't assume dry if the sensor already sees water
+    // the moment this thing boots.
+    //
+    // Confirmed wiring: this module outputs a voltage that rises
+    // toward 5V as more water bridges its sensing traces, so a
+    // plain digitalRead() reads it as a simple threshold:
+    //
+    // HIGH = water detected
+    // LOW  = dry
+    //
+    waterStable = (digitalRead(WATER_PIN) == HIGH);
+    waterLast = waterStable;
+
+  #endif
 
 
   // ───────────────────────────────────────────────────────────
@@ -608,8 +651,25 @@ void setup()
     // of only reporting it on the next transition. Without this,
     // a door that's already open at boot is invisible to the Pi
     // until someone closes and reopens it.
+    //
+    // Report both states here (not just "open") so a fresh MQTT
+    // subscriber has something to show immediately, rather than
+    // waiting on either a real transition or the next periodic
+    // report to get its first value.
     if (doorStable) {
       Serial.println(F("EVT DOOR OPEN"));
+    } else {
+      Serial.println(F("EVT DOOR CLOSED"));
+    }
+
+  #endif
+
+  #if ENABLE_WATER
+
+    if (waterStable) {
+      Serial.println(F("EVT WATER DETECTED"));
+    } else {
+      Serial.println(F("EVT WATER CLEARED"));
     }
 
   #endif
@@ -650,6 +710,11 @@ void loop()
   #endif
 
 
+  #if ENABLE_WATER
+    checkWater();
+  #endif
+
+
   checkResets();
 
 
@@ -687,13 +752,13 @@ void initializeRelays()
     //                          caused by the hardware watchdog —
     //                          matches failsafe() behavior below)
     //
-    // ACTIVE LOW board: de-energized = HIGH.
-    digitalWrite(relayPins[i], HIGH);
+    // ACTIVE LOW board: de-energized = RELAY_COIL_OFF (HIGH).
+    digitalWrite(relayPins[i], RELAY_COIL_OFF);
 
     pinMode(relayPins[i], OUTPUT);
 
     // Explicitly establish the same state again after OUTPUT.
-    digitalWrite(relayPins[i], HIGH);
+    digitalWrite(relayPins[i], RELAY_COIL_OFF);
 
     resets[i].active = false;
     resets[i].start = 0;
@@ -995,92 +1060,66 @@ void processCommand(char *cmd)
   //
   // ───────────────────────────────────────────────────────────
 
-  if (strncmp(cmd, "RESET ", 6) == 0) {
+if (strncmp(cmd, "RESET ", 6) == 0) {
 
     const char *p = cmd + 6;
 
+    // Find the space between relay number and seconds
+    char *space = (char *)strchr(p, ' ');
+    if (!space) return;
 
-    // Relay number
+    // Temporarily terminate so parseUnsignedLong only sees "4"
+    *space = '\0';
+
     unsigned long relayNumber = 0;
-
     if (!parseUnsignedLong(p, &relayNumber)) {
+      Serial.println("FAIL: parse relay number");
+      *space = ' ';
       return;
     }
 
+    // Restore the space
+    *space = ' ';
 
-    if (relayNumber < 1UL ||
-        relayNumber > 8UL) {
+    if (relayNumber < 1UL || relayNumber > 8UL) {
+      Serial.println("FAIL: relay number out of range");
       return;
     }
 
-
-    // Find separator after relay number.
-    while (*p >= '0' && *p <= '9') {
-      p++;
-    }
-
-
-    if (*p != ' ') {
-      return;
-    }
-
-
-    while (*p == ' ') {
-      p++;
-    }
-
-
-    // Seconds
+    // Now parse seconds from after the space
+    const char *s = space + 1;
     unsigned long seconds = 0;
-
-    if (!parseUnsignedLong(p, &seconds)) {
+    if (!parseUnsignedLong(s, &seconds)) {
+      Serial.println("FAIL: parse seconds");
       return;
     }
 
-
-    // No trailing junk.
-    while (*p >= '0' && *p <= '9') {
-      p++;
-    }
-
-    if (*p != '\0') {
+    if (seconds < RESET_MIN_SECONDS || seconds > RESET_MAX_SECONDS) {
+      Serial.println("FAIL: seconds out of range");
       return;
     }
-
-
-    if (seconds < RESET_MIN_SECONDS ||
-        seconds > RESET_MAX_SECONDS) {
-      return;
-    }
-
 
     uint8_t idx = (uint8_t)(relayNumber - 1UL);
 
-
-    // Only NC loads are permitted to use the RESET command.
     if (!relayNC[idx]) {
+      Serial.println("FAIL: not NC");
       return;
     }
-
 
     if (resets[idx].active) {
+      Serial.println("FAIL: already active");
       return;
     }
 
-
     relaySet(idx, false);
-
-
     resets[idx].active = true;
     resets[idx].start = millis();
     resets[idx].duration = seconds * 1000UL;
 
-
     Serial.print(F("EVT RESET STARTED "));
     Serial.println(relayNumber);
-
     return;
-  }
+}
 
 
   // Unknown command:
@@ -1181,7 +1220,7 @@ void relaySet(uint8_t idx, bool loadOn)
 
   digitalWrite(
     relayPins[idx],
-    coilEnergized ? LOW : HIGH
+    coilEnergized ? RELAY_COIL_ON : RELAY_COIL_OFF
   );
 }
 
@@ -1507,6 +1546,10 @@ void checkTempAlarms()
 
     // Hysteresis prevents alarm chatter.
 
+    if (fireReported) {
+      Serial.println(F("EVT FIRE CLEARED"));
+    }
+
     fireReported = false;
   }
 
@@ -1583,6 +1626,10 @@ void checkTempAlarms()
 
   } else {
 
+    if (clogReported) {
+      Serial.println(F("EVT FILTER CLEARED"));
+    }
+
     fanWasLow = true;
     clogReported = false;
   }
@@ -1595,10 +1642,10 @@ void checkTempAlarms()
 //
 //  D11 → endstop → GND
 //
-//  INPUT_PULLUP:
+//  INPUT_PULLUP, confirmed by direct hardware test:
 //
-//    HIGH = door closed
-//    LOW  = door open
+//    HIGH = door open    (switch released)
+//    LOW  = door closed  (switch pressed, pulls to GND)
 //
 //  The startup state is read from the actual pin, so the system
 //  does not falsely assume the door is closed.
@@ -1612,40 +1659,91 @@ void checkTempAlarms()
 void checkDoor()
 {
   bool doorRaw =
-    (digitalRead(DOOR_PIN) == LOW);
+    (digitalRead(DOOR_PIN) == HIGH);
 
 
   if (doorRaw != doorLast) {
-
-    doorPending = true;
-
     doorChangeTime = millis();
+  }
 
-  } else if (doorPending) {
-
-    if ((millis() - doorChangeTime) >= DEBOUNCE_MS) {
-
-      doorPending = false;
-
-      doorLast = doorRaw;
-
-
-      if (doorRaw != doorStable) {
-
-        doorStable = doorRaw;
+  // Updated every single pass, unconditionally — this is the
+  // detail the earlier version got wrong. Without it, once doorRaw
+  // differs from doorLast, that comparison stays true forever
+  // (doorLast never catches up), doorChangeTime keeps getting
+  // reset to "now" every loop, and the debounce timer can never
+  // actually finish counting. That's a permanent deadlock, not a
+  // flaky one — which is exactly "never responds, no matter how
+  // long you wait."
+  doorLast = doorRaw;
 
 
-        relaySet(DOOR_LIGHT_RELAY_INDEX, doorStable);
+  if ((millis() - doorChangeTime) >= DEBOUNCE_MS &&
+      doorRaw != doorStable) {
 
-        if (doorStable) {
+    doorStable = doorRaw;
 
-          Serial.println(F("EVT DOOR OPEN"));
 
-        } else {
+    relaySet(DOOR_LIGHT_RELAY_INDEX, doorStable);
 
-          Serial.println(F("EVT DOOR CLOSED"));
-        }
-      }
+    if (doorStable) {
+
+      Serial.println(F("EVT DOOR OPEN"));
+
+    } else {
+
+      Serial.println(F("EVT DOOR CLOSED"));
+    }
+  }
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+//  WATER DETECTION
+// ═══════════════════════════════════════════════════════════════
+//
+//  WATER_PIN (A4) → Gikfun-style analog leak sensor, read here as
+//  a simple threshold rather than a proportional value.
+//
+//  Confirmed by direct test: bridging the sensor pin to 5V (fully
+//  "wet") reads HIGH; releasing it (dry) settles LOW.
+//
+//    HIGH = water detected
+//    LOW  = dry
+//
+//  Same debounce shape as checkDoor() above — this is a plain
+//  edge-triggered detector, not a continuous reading. It only
+//  ever prints on an actual transition, so it can't spam the log
+//  or the dashboard.
+//
+
+void checkWater()
+{
+  bool waterRaw =
+    (digitalRead(WATER_PIN) == HIGH);
+
+
+  if (waterRaw != waterLast) {
+    waterChangeTime = millis();
+  }
+
+  // Same fix as checkDoor(): update unconditionally every pass,
+  // or this deadlocks and never commits a change.
+  waterLast = waterRaw;
+
+
+  if ((millis() - waterChangeTime) >= DEBOUNCE_MS &&
+      waterRaw != waterStable) {
+
+    waterStable = waterRaw;
+
+
+    if (waterStable) {
+
+      Serial.println(F("EVT WATER DETECTED"));
+
+    } else {
+
+      Serial.println(F("EVT WATER CLEARED"));
     }
   }
 }
@@ -1751,11 +1849,18 @@ void periodicReport()
   #endif
 
 
+  #if ENABLE_DOOR
+
+    Serial.print(F(" DOOR "));
+    Serial.print(doorStable ? F("OPEN") : F("CLOSED"));
+
+  #endif
+
+
   #if ENABLE_WATER
 
-    if (digitalRead(A4) == LOW) {
-      Serial.print(F(" WATER"));
-    }
+    Serial.print(F(" WATER "));
+    Serial.print(waterStable ? F("DETECTED") : F("CLEARED"));
 
   #endif
 

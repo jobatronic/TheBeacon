@@ -93,12 +93,16 @@
  *          sensor, if/when one is added — see note below)
  *    D13 – reserved / onboard LED
  *
- *    A0  – reserved / external analog sensor
- *    A1  – reserved: CT coil / AC current
- *    A2  – reserved: DC voltage divider
+ *    A0  – fan 1 tach
+ *    A1  – fan 2 tach
+ *    A2  – fan 3 tach
  *    A3  – Keyestudio analog temperature sensor (exhaust)
  *    A4  – water leak sensor (bottom pan)
- *    A5  – reserved
+ *    A5  – reserved (last free analog pin — measureVacRms /
+ *          measureIacRms / measureDc12v below are unimplemented
+ *          stubs that assumed A1/A2, now claimed by tach; a
+ *          future AC/DC sensor would need to move to A5 or a
+ *          digital pin instead)
  *
  *    EXHAUST TEMPERATURE SENSOR (A3):
  *      Keyestudio "Analog Temperature Sensor Detection Module"
@@ -128,6 +132,7 @@
 #if defined(__AVR_ATmega328P__)
   #include <avr/wdt.h>
   #include <avr/io.h>
+  #include <avr/interrupt.h>
 #endif
 
 
@@ -225,8 +230,17 @@ const bool relayNC[8] = {
 
 #define FAN_PIN             3
 
-#define FAN_TARGET_TEMP     35.0f
-#define FAN_MIN_SPEED       30
+#define FAN_TARGET_TEMP     28.0f
+#define FAN_MIN_SPEED       255   // Locked to 100% — this cabinet
+                                   // needs full airflow 24/7
+                                   // regardless of temperature, so
+                                   // floor == ceiling. The PID
+                                   // logic below is untouched and
+                                   // harmless either way (every
+                                   // branch clamps to this floor),
+                                   // so this is a one-line, fully
+                                   // reversible decision if that
+                                   // ever changes.
 
 #define FAN_KP              4.0f
 #define FAN_KI              0.5f
@@ -237,6 +251,49 @@ const bool relayNC[8] = {
 
 #define FAN_CLOG_THRESHOLD  60000UL
 #define FAN_CLOG_DELTA      2.0f
+
+
+// ═══════════════════════════════════════════════════════════════
+//  FAN TACHOMETERS
+// ═══════════════════════════════════════════════════════════════
+//
+//  These are genuine 3-pin fans (+12V, GND, TACH) — the tach wire
+//  is an open-collector output inside the fan that pulls to GND
+//  twice per shaft revolution (the standard across virtually all
+//  PC fans). INPUT_PULLUP gives it something to pull against; no
+//  external resistor needed.
+//
+//  A0/A1/A2 were chosen deliberately: on the ATmega328P they're
+//  PCINT8/9/10, all three inside the SAME pin-change-interrupt
+//  bank (PCINT1) — so one shared interrupt handler covers all
+//  three tach wires, rather than needing separate wiring per pin.
+//  (The two "true" hardware interrupt pins, D2/D3, were already
+//  spoken for by R1 and FAN_PIN.)
+//
+//  TACH_PULSES_PER_REV = 2 is the standard for PC fans generally;
+//  it's not a spec this exact fan's datasheet confirms, but it's
+//  close to universal across the industry.
+//
+
+#define FAN1_TACH_PIN        A0
+#define FAN2_TACH_PIN        A1
+#define FAN3_TACH_PIN        A2
+
+#define TACH_PULSES_PER_REV  2
+#define TACH_CHECK_INTERVAL  2000UL
+
+// Below this, a fan is considered stopped rather than "just slow".
+#define TACH_SPINNING_RPM    100
+
+// Pin-change interrupts have no built-in debouncing, and these
+// wires run near a MOSFET chopping 12V — real-world testing found
+// implausible readings (up to ~14,000 RPM on a fan rated for
+// 2,000 max) caused by electrical noise being counted as pulses.
+// Reject anything faster than this could possibly be for a real
+// fan. At 2 pulses/rev, 8ms still allows correctly reading fans
+// up to ~3,750 RPM — comfortably above these fans' real 2,000 RPM
+// max, so this only filters out noise, never a genuine reading.
+#define TACH_MIN_PULSE_MS    8
 
 
 // ═══════════════════════════════════════════════════════════════
@@ -385,6 +442,35 @@ unsigned long lastFanUpdate = 0;
 bool fanAutoMode = true;
 
 
+// ─── Fan tachometers ──────────────────────────────────────────
+//
+//  The pulse counters are touched inside an ISR, so they must be
+//  volatile. Everything else here is only ever touched from the
+//  normal loop() side, in checkFanTach().
+
+volatile uint16_t fan1PulseCount = 0;
+volatile uint16_t fan2PulseCount = 0;
+volatile uint16_t fan3PulseCount = 0;
+
+// Last accepted pulse time per channel, for rejecting anything
+// faster than TACH_MIN_PULSE_MS as electrical noise rather than a
+// real revolution.
+volatile unsigned long fan1LastPulseMs = 0;
+volatile unsigned long fan2LastPulseMs = 0;
+volatile unsigned long fan3LastPulseMs = 0;
+
+// Snapshot of PINC (A0-A5) from the last interrupt, so the ISR
+// can tell which bit(s) specifically fell (pulsed), rather than
+// just "something on this bank changed".
+volatile uint8_t lastPinCState = 0;
+
+uint16_t fan1Rpm = 0;
+uint16_t fan2Rpm = 0;
+uint16_t fan3Rpm = 0;
+
+unsigned long lastTachCheck = 0;
+
+
 // ─── Fan clog detection ──────────────────────────────────────
 
 float fanPeakTemp = 0.0f;
@@ -482,6 +568,8 @@ void initializeRelays();
 
 void updateFan();
 
+void checkFanTach();
+
 void checkTempAlarms();
 
 void checkDoor();
@@ -573,12 +661,28 @@ void setup()
   // ANALOG PINS
   // ───────────────────────────────────────────────────────────
 
-  pinMode(A0, INPUT);
-  pinMode(A1, INPUT);
-  pinMode(A2, INPUT);
+  // A0/A1/A2 are now the fan tach inputs (see FAN TACHOMETERS
+  // above) — open-collector outputs need the internal pullup to
+  // have something to pull against.
+  pinMode(FAN1_TACH_PIN, INPUT_PULLUP);
+  pinMode(FAN2_TACH_PIN, INPUT_PULLUP);
+  pinMode(FAN3_TACH_PIN, INPUT_PULLUP);
+
   pinMode(A3, INPUT);
   pinMode(WATER_PIN, INPUT);
   pinMode(A5, INPUT);
+
+
+  #if defined(__AVR_ATmega328P__)
+
+    // Enable pin-change interrupts on PCINT8/9/10 (A0/A1/A2) —
+    // one shared bank, one shared handler for all 3 tach wires.
+    lastPinCState = PINC;
+
+    PCMSK1 |= _BV(PCINT8) | _BV(PCINT9) | _BV(PCINT10);
+    PCICR  |= _BV(PCIE1);
+
+  #endif
 
 
   // ───────────────────────────────────────────────────────────
@@ -702,6 +806,7 @@ void loop()
 
   #if ENABLE_FAN
     updateFan();
+    checkFanTach();
   #endif
 
 
@@ -1060,66 +1165,94 @@ void processCommand(char *cmd)
   //
   // ───────────────────────────────────────────────────────────
 
-if (strncmp(cmd, "RESET ", 6) == 0) {
+  if (strncmp(cmd, "RESET ", 6) == 0) {
 
     const char *p = cmd + 6;
 
-    // Find the space between relay number and seconds
-    char *space = (char *)strchr(p, ' ');
-    if (!space) return;
 
-    // Temporarily terminate so parseUnsignedLong only sees "4"
+    // parseUnsignedLong() requires its ENTIRE input to be digits
+    // — that's correct for single-value commands like "FAN 200",
+    // but RESET has two numbers ("4 30"), and handing it the
+    // whole remainder at once meant it always hit the space in
+    // the middle and silently failed, every single time, with no
+    // error printed. Isolate each number first by temporarily
+    // cutting the string at the separating space.
+
+    char *space = strchr((char *)p, ' ');
+
+    if (!space) {
+      Serial.println(F("FAIL: RESET needs <relay> <seconds>"));
+      return;
+    }
+
     *space = '\0';
 
     unsigned long relayNumber = 0;
+
     if (!parseUnsignedLong(p, &relayNumber)) {
-      Serial.println("FAIL: parse relay number");
+      Serial.println(F("FAIL: bad relay number"));
       *space = ' ';
       return;
     }
 
-    // Restore the space
     *space = ' ';
 
-    if (relayNumber < 1UL || relayNumber > 8UL) {
-      Serial.println("FAIL: relay number out of range");
+
+    if (relayNumber < 1UL ||
+        relayNumber > 8UL) {
+      Serial.println(F("FAIL: relay number out of range"));
       return;
     }
 
-    // Now parse seconds from after the space
-    const char *s = space + 1;
+
+    // Seconds — this one genuinely does run to the end of the
+    // buffer with nothing trailing, so it's fine as-is.
+    const char *secondsText = space + 1;
+
     unsigned long seconds = 0;
-    if (!parseUnsignedLong(s, &seconds)) {
-      Serial.println("FAIL: parse seconds");
+
+    if (!parseUnsignedLong(secondsText, &seconds)) {
+      Serial.println(F("FAIL: bad seconds value"));
       return;
     }
 
-    if (seconds < RESET_MIN_SECONDS || seconds > RESET_MAX_SECONDS) {
-      Serial.println("FAIL: seconds out of range");
+
+    if (seconds < RESET_MIN_SECONDS ||
+        seconds > RESET_MAX_SECONDS) {
+      Serial.println(F("FAIL: seconds out of range"));
       return;
     }
+
 
     uint8_t idx = (uint8_t)(relayNumber - 1UL);
 
+
+    // Only NC loads are permitted to use the RESET command.
     if (!relayNC[idx]) {
-      Serial.println("FAIL: not NC");
+      Serial.println(F("FAIL: relay is not NC"));
       return;
     }
+
 
     if (resets[idx].active) {
-      Serial.println("FAIL: already active");
+      Serial.println(F("FAIL: reset already active"));
       return;
     }
 
+
     relaySet(idx, false);
+
+
     resets[idx].active = true;
     resets[idx].start = millis();
     resets[idx].duration = seconds * 1000UL;
 
+
     Serial.print(F("EVT RESET STARTED "));
     Serial.println(relayNumber);
+
     return;
-}
+  }
 
 
   // Unknown command:
@@ -1353,6 +1486,34 @@ void updateFan()
   }
 
 
+  // Door open: cooling the open room air is pointless, so hold
+  // the fan off while auto mode would otherwise be deciding a
+  // speed from temperature. This does NOT override watchdogFired
+  // above (failsafe still wins — we don't know why the Pi is gone
+  // or whether the door will stay open, so max cooling stays the
+  // safer default), and does NOT override an explicit manual
+  // FAN <n> command — that's a deliberate human choice regardless
+  // of door state, same precedent as elsewhere in this file.
+  //
+  // fanIntegral is deliberately left untouched here rather than
+  // reset to 0, so the controller resumes close to where it left
+  // off the moment the door closes again, instead of re-ramping
+  // from scratch every time.
+
+  #if ENABLE_DOOR
+
+    if (fanAutoMode && doorStable) {
+
+      fanSpeed = 0;
+
+      analogWrite(FAN_PIN, 0);
+
+      return;
+    }
+
+  #endif
+
+
   // ───────────────────────────────────────────────────────────
   // Automatic mode (proportional + integral, with decay)
   // ───────────────────────────────────────────────────────────
@@ -1468,6 +1629,112 @@ void updateFan()
 
 
   analogWrite(FAN_PIN, fanSpeed);
+}
+
+
+// ═══════════════════════════════════════════════════════════════
+//  FAN TACHOMETER READING
+// ═══════════════════════════════════════════════════════════════
+//
+//  One shared interrupt handler for all 3 tach wires (see FAN
+//  TACHOMETERS config above for why they're grouped this way).
+//
+//  Pin-change interrupts fire on ANY change (rising or falling),
+//  but a "pulse" is specifically a falling edge (the fan pulling
+//  the line to GND). So this compares the current pin snapshot
+//  against the last one, and only counts bits that went from 1
+//  to 0 — a plain "did it change" check would double-count every
+//  revolution (once on the way down, once on the way back up).
+//
+//  Kept deliberately tiny and fast, as any ISR should be.
+//
+
+#if defined(__AVR_ATmega328P__)
+
+ISR(PCINT1_vect)
+{
+  uint8_t current = PINC;
+
+  uint8_t fell = (current ^ lastPinCState) & lastPinCState;
+
+  unsigned long now = millis();
+
+  if (fell & _BV(PINC0)) {  // A0
+    if ((now - fan1LastPulseMs) >= TACH_MIN_PULSE_MS) {
+      fan1PulseCount++;
+      fan1LastPulseMs = now;
+    }
+  }
+
+  if (fell & _BV(PINC1)) {  // A1
+    if ((now - fan2LastPulseMs) >= TACH_MIN_PULSE_MS) {
+      fan2PulseCount++;
+      fan2LastPulseMs = now;
+    }
+  }
+
+  if (fell & _BV(PINC2)) {  // A2
+    if ((now - fan3LastPulseMs) >= TACH_MIN_PULSE_MS) {
+      fan3PulseCount++;
+      fan3LastPulseMs = now;
+    }
+  }
+
+  lastPinCState = current;
+}
+
+#endif
+
+
+//  Turns raw pulse counts into RPM every TACH_CHECK_INTERVAL, and
+//  resets the counters for the next window. The brief
+//  noInterrupts()/interrupts() pair is just to read+clear each
+//  counter atomically — without it, the ISR could increment a
+//  counter in the middle of it being read, corrupting the value.
+//  It's a handful of instructions, not a real blocking concern.
+
+void checkFanTach()
+{
+  unsigned long now = millis();
+
+  if ((now - lastTachCheck) < TACH_CHECK_INTERVAL) {
+    return;
+  }
+
+  unsigned long elapsedMs = now - lastTachCheck;
+
+  lastTachCheck = now;
+
+
+  uint16_t count1;
+  uint16_t count2;
+  uint16_t count3;
+
+  noInterrupts();
+
+  count1 = fan1PulseCount;
+  fan1PulseCount = 0;
+
+  count2 = fan2PulseCount;
+  fan2PulseCount = 0;
+
+  count3 = fan3PulseCount;
+  fan3PulseCount = 0;
+
+  interrupts();
+
+
+  fan1Rpm =
+    (uint16_t)(((unsigned long)count1 * 60000UL) /
+               (TACH_PULSES_PER_REV * elapsedMs));
+
+  fan2Rpm =
+    (uint16_t)(((unsigned long)count2 * 60000UL) /
+               (TACH_PULSES_PER_REV * elapsedMs));
+
+  fan3Rpm =
+    (uint16_t)(((unsigned long)count3 * 60000UL) /
+               (TACH_PULSES_PER_REV * elapsedMs));
 }
 
 
@@ -1828,6 +2095,29 @@ void periodicReport()
 
   Serial.print(F(" FAN "));
   Serial.print(fanSpeed);
+
+
+  #if ENABLE_FAN
+
+    Serial.print(F(" TACH1 "));
+    Serial.print(fan1Rpm);
+
+    Serial.print(F(" TACH2 "));
+    Serial.print(fan2Rpm);
+
+    Serial.print(F(" TACH3 "));
+    Serial.print(fan3Rpm);
+
+  #endif
+
+
+  // Same reasoning as DOOR/WATER: without this, a fire tile that
+  // never received a single message just sits at "unknown"
+  // forever, which defeats the entire point of a safety status
+  // indicator — it should say "still fine" continuously, not stay
+  // silent until the one day it isn't.
+  Serial.print(F(" FIRE "));
+  Serial.print(fireReported ? F("ALARM") : F("SAFE"));
 
 
   #if ENABLE_AC_SENSORS
